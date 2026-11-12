@@ -70,7 +70,8 @@
   <header>
     <h1>Delta Lake 版本可恢复性分析</h1>
     <p>上传 _delta_log 留存的 JSON 提交 / 经典单文件 Parquet 检查点与现存数据文件清单，
-       逐版重放并核对快照引用，找出文件齐全、可完整重建的版本。仅支持无删除向量的表。</p>
+       逐版重放并核对快照引用，找出文件齐全、可完整重建的版本。仅支持无删除向量的表。
+       旧提交转入冷存储前，也可在此生成目标版本的经典单文件检查点作为重放起点。</p>
   </header>
 
   <main>
@@ -104,7 +105,42 @@
     </section>
 
     <section class="card">
-      <h2>2. 或直接加载本地样例</h2>
+      <h2>2. 生成重放起点检查点（旧提交转入冷存储前）</h2>
+      <form method="post" action="/checkpoint" enctype="multipart/form-data" id="checkpoint-form">
+        <div class="row">
+          <div>
+            <label for="target_version">目标版本</label>
+            <input type="number" id="target_version" name="target_version" min="0"
+                   value="{{ form.target_version if form else 2 }}" required>
+          </div>
+        </div>
+        <label for="commit_files">0 版到目标版的全部 JSON 提交（可多选，无需数据文件）</label>
+        <input type="file" id="commit_files" name="commit_files" multiple
+               accept=".json" required>
+        <div class="hint">仅支持无分区、无删除向量且协议为 minReaderVersion=1 /
+          minWriterVersion=2 的表。提交断档、日志无效或超出支持范围时会说明原因，
+          不提供下载。</div>
+        <button class="btn-primary" type="submit" id="checkpoint-btn">生成并下载检查点</button>
+      </form>
+      <label style="margin-top:18px">或用本地样例直接下载检查点</label>
+      <div class="row">
+        {% for key, meta in samples.items() %}
+        <div>
+          <div class="kv" style="margin-bottom:6px">{{ meta.label }}</div>
+          <input type="number" id="ckpt-target-{{ key }}" min="0" value="2"
+                 style="width:110px">
+          <button class="btn-sample btn-ckpt" type="button"
+                  data-sample="{{ key }}">下载检查点</button>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="hint">下载后把它与后一版提交一起交给第 1 节核查即可：无需补传更早的
+        提交，查到的文件引用与从 0 版重放一致。误删事故样例目标版填 3 及以上会因
+        v3 提交丢失而报断档。</div>
+    </section>
+
+    <section class="card">
+      <h2>3. 或直接加载本地样例</h2>
       <div>
         {% for key, meta in samples.items() %}
         <button class="btn-sample" data-sample="{{ key }}"
@@ -210,6 +246,49 @@
     document.getElementById('analyze-form').addEventListener('submit', () => {
       document.getElementById('submit-btn').disabled = true;
       document.getElementById('submit-btn').textContent = '分析中…';
+    });
+
+    document.getElementById('checkpoint-form').addEventListener('submit', () => {
+      document.getElementById('checkpoint-btn').disabled = true;
+      document.getElementById('checkpoint-btn').textContent = '生成中…';
+    });
+
+    document.querySelectorAll('.btn-ckpt').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const input = document.getElementById('ckpt-target-' + btn.dataset.sample);
+        const target = Number(input.value);
+        btn.disabled = true;
+        try {
+          const resp = await fetch('/api/checkpoint-sample/' + btn.dataset.sample, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target_version: target})
+          });
+          if (!resp.ok) {
+            let msg = '检查点生成失败（HTTP ' + resp.status + '）';
+            try { const d = await resp.json(); if (d.error) msg = d.error; } catch (e) {}
+            showError(msg);
+            return;
+          }
+          const blob = await resp.blob();
+          let fname = String(target).padStart(20, '0') + '.checkpoint.parquet';
+          const cd = resp.headers.get('Content-Disposition') || '';
+          const m = cd.match(/filename="?([^";]+)"?/);
+          if (m) fname = m[1];
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = fname;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        } catch (e) {
+          showError('请求检查点接口失败：' + e);
+        } finally {
+          btn.disabled = false;
+        }
+      });
     });
 
     document.querySelectorAll('.btn-sample').forEach(btn => {

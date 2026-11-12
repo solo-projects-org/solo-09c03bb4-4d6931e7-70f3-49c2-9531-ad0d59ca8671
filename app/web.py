@@ -1,18 +1,24 @@
-"""Flask 网页：Delta Lake 版本可恢复性分析。
+"""Flask 网页：Delta Lake 版本可恢复性分析 + 重放起点检查点生成。
 
 值班员在页面上填写版本区间，上传 _delta_log 留存的 JSON 提交、
 经典单文件 Parquet 检查点，以及现存数据文件的表内相对路径清单，
 提交后逐版展示可恢复性结论。页面也可一键加载仓库内置的本地样例。
+
+旧提交转入冷存储前，还可在页面下半部生成重放起点：填目标版号、
+上传 0 版到该版的全部 JSON 提交，即可下载按目标版号命名的经典单文件
+Parquet 检查点；本地样例同样支持直接下载检查点。
 """
 
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
 from .analyzer import AnalyzerError, InputFile, analyze
+from .checkpoint import build_checkpoint
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 单次请求上限 256MB
@@ -86,6 +92,54 @@ def list_samples():
         key: {"label": meta["label"], "range": list(meta["range"])}
         for key, meta in SAMPLES.items()
     })
+
+
+def _checkpoint_response(data: bytes, download_name: str):
+    return send_file(io.BytesIO(data),
+                     mimetype="application/octet-stream",
+                     as_attachment=True,
+                     download_name=download_name)
+
+
+@app.post("/checkpoint")
+def generate_checkpoint():
+    """上传 0 版到目标版的 JSON 提交，生成并下载经典单文件检查点。"""
+    try:
+        target_version = _parse_version(request.form.get("target_version"),
+                                        "目标版本")
+        commit_files = _read_uploads("commit_files")
+        data, download_name = build_checkpoint(commit_files, target_version)
+    except AnalyzerError as exc:
+        return render_template("index.html", samples=SAMPLES, error=str(exc),
+                               form=request.form), 400
+    return _checkpoint_response(data, download_name)
+
+
+@app.post("/api/checkpoint-sample/<sample_name>")
+def checkpoint_sample(sample_name: str):
+    """用服务器本地样例的 JSON 提交生成检查点，无需手动上传。"""
+    if sample_name not in SAMPLES:
+        return jsonify({"error": f"未知样例：{sample_name}"}), 404
+    log_dir = SAMPLE_ROOT / sample_name / "_delta_log"
+    if not log_dir.is_dir():
+        return jsonify({"error": f"样例日志目录不存在：{log_dir}"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        target_version = int(payload.get("target_version"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "目标版本必须是整数"}), 400
+
+    commit_files = [InputFile(filename=path.name, data=path.read_bytes())
+                    for path in sorted(log_dir.iterdir())
+                    if path.is_file() and path.suffix == ".json"]
+    try:
+        data, download_name = build_checkpoint(commit_files, target_version)
+    except AnalyzerError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except OSError as exc:
+        return jsonify({"error": f"读取样例失败：{exc}"}), 500
+    return _checkpoint_response(data, download_name)
 
 
 @app.post("/api/analyze-sample/<sample_name>")

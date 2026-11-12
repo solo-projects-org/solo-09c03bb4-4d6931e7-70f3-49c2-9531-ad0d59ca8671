@@ -63,6 +63,33 @@ def remove_action(path: str) -> dict:
 
 PROTOCOL_ACTION = {"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}
 
+_SCHEMA_STRING = json.dumps({
+    "type": "struct",
+    "fields": [
+        {"name": "order_id", "type": "long", "nullable": False, "metadata": {}},
+        {"name": "amount", "type": "double", "nullable": True, "metadata": {}},
+    ],
+}, separators=(",", ":"))
+
+
+def metadata_action(table_id: str, configuration: dict | None = None) -> dict:
+    """订单表的 metaData 动作（无分区、parquet 格式）。"""
+    return {"metaData": {
+        "id": table_id,
+        "name": "orders",
+        "description": "样例订单表",
+        "format": {"provider": "parquet", "options": {}},
+        "schemaString": _SCHEMA_STRING,
+        "partitionColumns": [],
+        "configuration": configuration or {},
+        "createdTime": 1700000000000,
+    }}
+
+
+def txn_action(app_id: str, version: int) -> dict:
+    return {"txn": {"appId": app_id, "version": version,
+                    "lastUpdated": 1700000200000}}
+
 
 def write_checkpoint(log_dir: Path, version: int,
                      active_paths: list[str], tombstone_paths: list[str]) -> None:
@@ -126,12 +153,17 @@ def build_healthy() -> None:
     log_dir.mkdir(parents=True)
 
     f = lambda n: f"data/part-{n:05d}-healthy.parquet"
-    write_commit(log_dir, 0, [PROTOCOL_ACTION, add_action(f(0)), add_action(f(1))])
-    write_commit(log_dir, 1, [add_action(f(2))])
+    write_commit(log_dir, 0, [PROTOCOL_ACTION, metadata_action("healthy-orders"),
+                              add_action(f(0)), add_action(f(1))])
+    write_commit(log_dir, 1, [txn_action("ingest", 1), add_action(f(2))])
     write_commit(log_dir, 2, [add_action(f(3)), remove_action(f(1))])
     # v2 检查点：当前活动文件 f0,f2,f3；f1 是墓碑
     write_checkpoint(log_dir, 2, [f(0), f(2), f(3)], [f(1)])
-    write_commit(log_dir, 3, [add_action(f(4))])
+    # v3 顺带更新表配置并推进 txn，验证检查点保留目标版生效的 metaData / txn
+    write_commit(log_dir, 3, [txn_action("ingest", 2),
+                              metadata_action("healthy-orders",
+                                              {"delta.appendOnly": "true"}),
+                              add_action(f(4))])
     write_commit(log_dir, 4, [add_action(f(5)), remove_action(f(2))])
 
     (log_dir / "_last_checkpoint").write_text(json.dumps({
@@ -147,8 +179,9 @@ def build_incident() -> None:
     log_dir.mkdir(parents=True)
 
     a = lambda n: f"data/part-{n:05d}-incident.parquet"
-    write_commit(log_dir, 0, [PROTOCOL_ACTION, add_action(a(0)), add_action(a(1))])
-    write_commit(log_dir, 1, [add_action(a(2))])
+    write_commit(log_dir, 0, [PROTOCOL_ACTION, metadata_action("incident-orders"),
+                              add_action(a(0)), add_action(a(1))])
+    write_commit(log_dir, 1, [txn_action("ingest", 1), add_action(a(2))])
     write_commit(log_dir, 2, [add_action(a(3)), remove_action(a(1))])
     write_checkpoint(log_dir, 2, [a(0), a(2), a(3)], [a(1)])
 
@@ -156,7 +189,7 @@ def build_incident() -> None:
     v3_lost = log_dir / commit_name(3)
     assert not v3_lost.exists()
 
-    write_commit(log_dir, 4, [add_action(a(5))])
+    write_commit(log_dir, 4, [txn_action("ingest", 2), add_action(a(5))])
     # v4 检查点在 v3 提交丢失前生成，保留了 v3 引入的 a4
     write_checkpoint(log_dir, 4, [a(0), a(2), a(3), a(4), a(5)], [a(1)])
     write_commit(log_dir, 5, [add_action(a(6)), remove_action(a(2))])

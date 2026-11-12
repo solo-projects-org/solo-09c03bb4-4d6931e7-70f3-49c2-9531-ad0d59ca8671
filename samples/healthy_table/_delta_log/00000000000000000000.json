@@ -1,3 +1,4 @@
 {"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}
+{"metaData": {"id": "healthy-orders", "name": "orders", "description": "样例订单表", "format": {"provider": "parquet", "options": {}}, "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"order_id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}", "partitionColumns": [], "configuration": {}, "createdTime": 1700000000000}}
 {"add": {"path": "data/part-00000-healthy.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
 {"add": {"path": "data/part-00001-healthy.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
