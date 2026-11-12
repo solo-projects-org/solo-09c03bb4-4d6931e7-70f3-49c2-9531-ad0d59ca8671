@@ -1,18 +1,26 @@
-"""Flask 网页：Delta Lake 版本可恢复性分析。
+"""Flask 网页：Delta Lake 版本可恢复性分析 + 重放起点检查点生成。
 
 值班员在页面上填写版本区间，上传 _delta_log 留存的 JSON 提交、
 经典单文件 Parquet 检查点，以及现存数据文件的表内相对路径清单，
-提交后逐版展示可恢复性结论。页面也可一键加载仓库内置的本地样例。
+提交后逐版展示可恢复性结论。
+
+旧提交转入冷存储前，也可以在生成入口填写目标版号、上传从 0 版到该版
+的 JSON 提交（无需数据文件），生成并下载按目标版号命名的经典单文件
+Parquet 检查点，作为后续核查的重放起点。页面也可一键加载仓库内置的
+本地样例。
 """
 
 from __future__ import annotations
 
+import io
 import os
+import re
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
 from .analyzer import AnalyzerError, InputFile, analyze
+from .checkpoint import CheckpointArtifact, build_checkpoint
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 单次请求上限 256MB
@@ -20,17 +28,21 @@ app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 单次请求上限 256MB
 SAMPLE_ROOT = Path(os.environ.get("SAMPLE_ROOT",
                                   Path(__file__).resolve().parent.parent / "samples"))
 
-# 样例目录名 -> 页面展示名 / 默认版本区间
+# 样例目录名 -> 页面展示名 / 默认版本区间 / 检查点生成演示的默认目标版号
 SAMPLES = {
     "healthy_table": {
         "label": "健康表样例（0-4 版均可重建）",
         "range": (0, 4),
+        "checkpoint_target": 2,
     },
     "incident_table": {
         "label": "误删事故样例（部分版本缺提交或缺数据文件）",
         "range": (0, 5),
+        "checkpoint_target": 2,
     },
 }
+
+_COMMIT_NAME_RE = re.compile(r"^(\d{20})\.json$")
 
 
 def _read_uploads(field_name: str) -> list[InputFile]:
@@ -60,6 +72,21 @@ def _run_analysis(log_files, manifest_files, from_version, to_version):
                    to_version=to_version)
 
 
+def _checkpoint_response(artifact: CheckpointArtifact):
+    """把生成的检查点作为附件返回，并带上内容统计供页面展示。"""
+    resp = send_file(
+        io.BytesIO(artifact.data),
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=artifact.filename,
+    )
+    resp.headers["X-Checkpoint-Version"] = str(artifact.target_version)
+    resp.headers["X-Checkpoint-Adds"] = str(artifact.add_count)
+    resp.headers["X-Checkpoint-Removes"] = str(artifact.remove_count)
+    resp.headers["X-Checkpoint-Txns"] = str(artifact.txn_count)
+    return resp
+
+
 @app.get("/")
 def index():
     return render_template("index.html", samples=SAMPLES)
@@ -80,10 +107,25 @@ def analyze_upload():
     return render_template("index.html", samples=SAMPLES, report=report)
 
 
+@app.post("/checkpoint")
+def generate_checkpoint():
+    """生成入口：上传 0 版到目标版号的 JSON 提交，下载检查点。"""
+    try:
+        target_version = _parse_version(request.form.get("target_version"),
+                                        "目标版号")
+        commit_files = _read_uploads("commit_files")
+        artifact = build_checkpoint(commit_files, target_version)
+    except AnalyzerError as exc:
+        return render_template("index.html", samples=SAMPLES,
+                               ckpt_error=str(exc), ckpt_form=request.form), 400
+    return _checkpoint_response(artifact)
+
+
 @app.get("/api/samples")
 def list_samples():
     return jsonify({
-        key: {"label": meta["label"], "range": list(meta["range"])}
+        key: {"label": meta["label"], "range": list(meta["range"]),
+              "checkpoint_target": meta["checkpoint_target"]}
         for key, meta in SAMPLES.items()
     })
 
@@ -121,6 +163,34 @@ def analyze_sample(sample_name: str):
     except (OSError, ValueError) as exc:
         return jsonify({"error": f"读取样例失败：{exc}"}), 500
     return jsonify(report)
+
+
+@app.post("/api/sample-checkpoint/<sample_name>")
+def sample_checkpoint(sample_name: str):
+    """用本地样例的 JSON 提交生成检查点，供一键下载验证。"""
+    if sample_name not in SAMPLES:
+        return jsonify({"error": f"未知样例：{sample_name}"}), 404
+    log_dir = SAMPLE_ROOT / sample_name / "_delta_log"
+    if not log_dir.is_dir():
+        return jsonify({"error": f"样例日志目录不存在：{log_dir}"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        target_version = int(payload.get("target_version"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "目标版号必须是整数"}), 400
+
+    commit_files = []
+    for path in sorted(log_dir.iterdir()):
+        match = _COMMIT_NAME_RE.match(path.name)
+        if match and int(match.group(1)) <= target_version:
+            commit_files.append(InputFile(filename=path.name,
+                                          data=path.read_bytes()))
+    try:
+        artifact = build_checkpoint(commit_files, target_version)
+    except AnalyzerError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return _checkpoint_response(artifact)
 
 
 @app.errorhandler(413)

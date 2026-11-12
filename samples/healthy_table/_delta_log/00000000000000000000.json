@@ -1,3 +1,4 @@
 {"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}
+{"metaData": {"id": "sample-healthy-table", "format": {"provider": "parquet", "options": {}}, "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}", "partitionColumns": [], "configuration": {}, "createdTime": 1700000000000}}
 {"add": {"path": "data/part-00000-healthy.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
 {"add": {"path": "data/part-00001-healthy.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}

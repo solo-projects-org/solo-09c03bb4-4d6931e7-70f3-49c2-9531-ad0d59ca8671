@@ -22,6 +22,7 @@
     .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
             padding: 20px 22px; margin-bottom: 20px; }
     .card h2 { margin: 0 0 14px; font-size: 17px; }
+    .card h3 { margin: 18px 0 8px; font-size: 14px; }
     label { display: block; font-weight: 600; font-size: 13px; margin: 12px 0 5px; }
     .row { display: flex; gap: 14px; flex-wrap: wrap; }
     .row > div { flex: 1; min-width: 150px; }
@@ -33,8 +34,11 @@
     .btn-primary:disabled { background: #9db4e8; cursor: wait; }
     .btn-sample { background: #eef2ff; color: #2b4acb; border: 1px solid #c7d2fe;
                   margin-right: 10px; margin-top: 8px; }
+    .btn-sample:disabled { opacity: .6; cursor: wait; }
     .error { background: var(--red-bg); color: var(--red-fg); border: 1px solid #f3c2c2;
              border-radius: 8px; padding: 12px 16px; margin-bottom: 18px; font-size: 14px; }
+    .ok-note { background: var(--green-bg); color: var(--green-fg); border: 1px solid #bfe6c9;
+               border-radius: 8px; padding: 12px 16px; font-size: 14px; }
     .summary { display: flex; gap: 14px; flex-wrap: wrap; }
     .stat { flex: 1; min-width: 160px; border: 1px solid var(--line); border-radius: 8px;
             padding: 12px 16px; background: #fafbfd; }
@@ -64,13 +68,20 @@
     .ignored strong { color: #9a6a1c; }
     details { margin-top: 8px; }
     summary { cursor: pointer; font-size: 12px; color: var(--blue); }
+    .sample-ckpt { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;
+                   border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+                   margin-top: 10px; background: #fafbfd; }
+    .sample-ckpt .grow { flex: 1; min-width: 220px; }
+    .sample-ckpt label { margin-top: 0; }
+    .sample-ckpt input { max-width: 140px; }
   </style>
 </head>
 <body>
   <header>
     <h1>Delta Lake 版本可恢复性分析</h1>
     <p>上传 _delta_log 留存的 JSON 提交 / 经典单文件 Parquet 检查点与现存数据文件清单，
-       逐版重放并核对快照引用，找出文件齐全、可完整重建的版本。仅支持无删除向量的表。</p>
+       逐版重放并核对快照引用；旧提交转入冷存储前，也可在此生成重放起点检查点。
+       仅支持无分区、无删除向量、protocol 为 minReaderVersion=1 / minWriterVersion=2 的表。</p>
   </header>
 
   <main>
@@ -96,6 +107,8 @@
                accept=".json,.parquet" required>
         <div class="hint">文件名须保持 20 位补零版本号，如 00000000000000000003.json、
           00000000000000000002.checkpoint.parquet</div>
+        <div class="hint">已用第 2 步生成检查点？把它和目标版号之后的 JSON 提交一起上传即可，
+          无需补传更早的提交。</div>
         <label for="manifest_files">现存数据文件表内相对路径清单（可多选，每行一个路径）</label>
         <input type="file" id="manifest_files" name="manifest_files" multiple accept=".txt,.csv">
         <div class="hint">例如 data/part-00000-aaa.parquet；缺失清单时所有引用文件都会被判为缺失</div>
@@ -104,7 +117,51 @@
     </section>
 
     <section class="card">
-      <h2>2. 或直接加载本地样例</h2>
+      <h2>2. 生成重放起点检查点（旧提交转冷存储前留档）</h2>
+      <p class="kv" style="margin-top:0">填写目标版号，上传从 0 版到该版的 Delta Lake JSON 提交
+        （无需数据文件），生成按目标版号命名的经典单文件 Parquet 检查点，如
+        <code>00000000000000000002.checkpoint.parquet</code>。检查点保留该版生效的
+        protocol 与 metaData，每条路径只写生效的 add 或 remove（墓碑不按时间淘汰），
+        文件动作 dataChange 写为 false，每个 appId 保留最后提交的 txn。
+        提交断档、日志无效或超出支持范围时会说明原因且不提供下载。</p>
+      {% if ckpt_error %}<div class="error">❌ {{ ckpt_error }}</div>{% endif %}
+      <form method="post" action="/checkpoint" enctype="multipart/form-data" id="ckpt-form">
+        <div class="row">
+          <div>
+            <label for="target_version">目标版号</label>
+            <input type="number" id="target_version" name="target_version" min="0"
+                   value="{{ ckpt_form.target_version if ckpt_form else 2 }}" required>
+          </div>
+        </div>
+        <label for="commit_files">Delta JSON 提交（0 版到目标版号，需连续无断档，可多选）</label>
+        <input type="file" id="commit_files" name="commit_files" multiple accept=".json" required>
+        <div class="hint">文件名须保持 20 位补零版本号，如 00000000000000000000.json …
+          00000000000000000002.json；请勿上传检查点或 _last_checkpoint</div>
+        <button class="btn-primary" type="submit" id="ckpt-submit-btn">生成并下载检查点</button>
+      </form>
+
+      <h3>或用本地样例立即生成</h3>
+      {% for key, meta in samples.items() %}
+      <div class="sample-ckpt">
+        <div class="grow">
+          <label for="ckpt-ver-{{ key }}">{{ meta.label }}</label>
+          <input type="number" id="ckpt-ver-{{ key }}" min="0"
+                 value="{{ meta.checkpoint_target }}">
+        </div>
+        <div style="flex:0 0 auto">
+          <button class="btn-sample btn-ckpt-sample" type="button"
+                  data-sample="{{ key }}">生成并下载检查点</button>
+        </div>
+      </div>
+      {% endfor %}
+      <div class="hint">样例由 Docker 镜像内 samples/ 目录提供；误删事故样例的 v3 提交已丢失，
+        目标版号 ≥3 可演示“提交断档”报错。下载后把它与目标版号之后的 JSON 提交一起交给
+        第 1 步的核查表单，查到的文件引用与从 0 版重放一致。</div>
+      <div id="ckpt-msg" style="margin-top:12px"></div>
+    </section>
+
+    <section class="card">
+      <h2>3. 或直接加载本地样例核查</h2>
       <div>
         {% for key, meta in samples.items() %}
         <button class="btn-sample" data-sample="{{ key }}"
@@ -212,6 +269,11 @@
       document.getElementById('submit-btn').textContent = '分析中…';
     });
 
+    document.getElementById('ckpt-form').addEventListener('submit', () => {
+      document.getElementById('ckpt-submit-btn').disabled = true;
+      document.getElementById('ckpt-submit-btn').textContent = '生成中…';
+    });
+
     document.querySelectorAll('.btn-sample').forEach(btn => {
       btn.addEventListener('click', async () => {
         btn.disabled = true;
@@ -232,6 +294,54 @@
           window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});
         } catch (e) {
           showError('请求样例接口失败：' + e);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+
+    function showCkptMessage(html) {
+      document.getElementById('ckpt-msg').innerHTML = html;
+    }
+
+    document.querySelectorAll('.btn-ckpt-sample').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const sample = btn.dataset.sample;
+        const input = document.getElementById('ckpt-ver-' + sample);
+        btn.disabled = true;
+        try {
+          const resp = await fetch('/api/sample-checkpoint/' + sample, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target_version: Number(input.value)})
+          });
+          if (!resp.ok) {
+            let msg = '生成失败';
+            try { msg = (await resp.json()).error || msg; } catch (e) {}
+            showCkptMessage('<div class="error">❌ ' + esc(msg) + '</div>');
+            return;
+          }
+          const blob = await resp.blob();
+          const cd = resp.headers.get('Content-Disposition') || '';
+          const m = cd.match(/filename="?([^";]+)"?/);
+          const fname = m ? m[1] : 'checkpoint.parquet';
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = fname;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          showCkptMessage(
+            '<div class="ok-note">✅ 已生成并下载 <strong>' + esc(fname) + '</strong>（' +
+            esc(resp.headers.get('X-Checkpoint-Adds') || '?') + ' 个生效 add、' +
+            esc(resp.headers.get('X-Checkpoint-Removes') || '?') + ' 个墓碑 remove、' +
+            esc(resp.headers.get('X-Checkpoint-Txns') || '?') + ' 个 txn）。' +
+            '把它与目标版号之后的 JSON 提交一起上传到第 1 步的核查表单，' +
+            '无需补传更早的提交，即可核对与从 0 版重放一致。</div>');
+        } catch (e) {
+          showCkptMessage('<div class="error">❌ 请求生成接口失败：' + esc(String(e)) + '</div>');
         } finally {
           btn.disabled = false;
         }
